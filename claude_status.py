@@ -26,6 +26,7 @@ import sys
 import tempfile
 import threading
 import argparse
+import atexit
 from datetime import datetime
 from pathlib import Path
 
@@ -36,8 +37,10 @@ DEFAULT_CONFIG = {
     "display_mode":       "both",       # "percent" | "bar" | "both"
     "show_value":         "remaining",  # "remaining" | "used"
     "bar_color":          "#00B4D8",    # hex colour (used when danger_bar is off)
+    "track_color":        "#464646",    # bar track / background colour
     "bar_width":          52,           # px
     "bar_height":         8,            # px
+    "bar_size":           "medium",    # "small" | "medium" | "large" | "xl"
     "show_type":          "5hr",        # "5hr" | "weekly"
     "refresh_interval":   120,          # seconds
     "session_key":        "",
@@ -47,18 +50,41 @@ DEFAULT_CONFIG = {
     "danger_orange_pct":  75,           # used% at which bar turns orange
     "danger_red_pct":     90,           # used% at which bar turns red
     "label_side":         "right",      # "left" | "right"  (in 'both' mode)
+    "panel_order":        "right",      # "left" | "right" ordering within tray cluster
     "show_logo":          False,        # show a 'C' glyph next to the bar
     "notify_at_pct":      0,            # 0 = off; send desktop notification when used% >= this
 }
 
 ICON_H = 22   # standard tray icon height (px)
+BAR_SIZE_PRESETS = {
+    'small': (44, 7),
+    'medium': (52, 8),
+    'large': (72, 11),
+    'xl': (92, 13),
+}
 
 
 # ── Colour helpers ─────────────────────────────────────────────────────────────
 
 def _hex_to_rgb(h):
-    h = h.lstrip('#')
-    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    h = str(h).strip().lstrip('#')
+    if len(h) != 6:
+        return 255, 255, 255
+    try:
+        return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    except ValueError:
+        return 255, 255, 255
+
+
+def _is_valid_hex_color(value):
+    value = str(value).strip()
+    if len(value) != 7 or not value.startswith('#'):
+        return False
+    try:
+        int(value[1:], 16)
+        return True
+    except ValueError:
+        return False
 
 
 def _danger_color(used_pct, cfg):
@@ -98,12 +124,22 @@ def _surface_to_pixbuf(surface):
 
 
 def _draw_logo(ctx, x, color_hex):
-    """Draw a small bold 'C' glyph as a stand-in for the Claude logo."""
+    """Draw a visible logo mark that survives panel scaling."""
     r, g, b = _hex_to_rgb(color_hex)
+    cx = x + 9
+    cy = ICON_H / 2
+
+    # Ring for contrast on any panel background.
+    ctx.set_source_rgba(r/255, g/255, b/255, 0.95)
+    ctx.set_line_width(2.0)
+    ctx.arc(cx, cy, 6.2, 0, 6.283185307179586)
+    ctx.stroke()
+
+    # Inner glyph.
     ctx.set_source_rgba(r/255, g/255, b/255, 1.0)
     ctx.select_font_face('Sans', _cairo.FONT_SLANT_NORMAL, _cairo.FONT_WEIGHT_BOLD)
-    ctx.set_font_size(14)
-    ctx.move_to(x + 2, 16)
+    ctx.set_font_size(11)
+    ctx.move_to(x + 5, 15)
     ctx.show_text('C')
 
 
@@ -119,11 +155,12 @@ def _draw_label_text(ctx, text, color_hex, x, width):
     ctx.show_text(text)
 
 
-def _draw_bar(ctx, fill_pct, color_hex, x_off, bar_w, bar_h):
+def _draw_bar(ctx, fill_pct, color_hex, track_hex, x_off, bar_w, bar_h):
     top  = (ICON_H - bar_h) // 2
     fill = int(bar_w * max(0.0, min(100.0, fill_pct)) / 100.0)
     # Track (dark background)
-    ctx.set_source_rgba(70/255, 70/255, 70/255, 0.7)
+    tr, tg, tb = _hex_to_rgb(track_hex)
+    ctx.set_source_rgba(tr/255, tg/255, tb/255, 0.75)
     ctx.rectangle(x_off, top, bar_w, bar_h)
     ctx.fill()
     # Filled portion
@@ -151,7 +188,7 @@ def _make_icon_pixbuf(fill_pct, bar_color, text_str, text_color, cfg):
     show_logo  = cfg.get('show_logo', False)
     show_bar   = mode in ('bar', 'both')
 
-    LOGO_W = 16 if show_logo else 0
+    LOGO_W = 18 if show_logo else 0
     BAR_W  = cfg['bar_width'] if show_bar else 0
     TEXT_W = (max(len(text_str) * 7 + 4, 24) if text_str else 0)
 
@@ -179,7 +216,8 @@ def _make_icon_pixbuf(fill_pct, bar_color, text_str, text_color, cfg):
         x += TEXT_W
 
     if show_bar:
-        _draw_bar(ctx, fill_pct, bar_color, x, cfg['bar_width'], cfg['bar_height'])
+        _draw_bar(ctx, fill_pct, bar_color, cfg['track_color'], x,
+                  cfg['bar_width'], cfg['bar_height'])
         x += BAR_W
 
     if label_side == 'right' and text_str:
@@ -191,6 +229,7 @@ def _make_icon_pixbuf(fill_pct, bar_color, text_str, text_color, cfg):
 def _make_bar_pixbuf_simple(fill_pct, color_hex, cfg):
     """Fallback when Cairo is unavailable — plain bar, no text or logo."""
     r, g, b  = _hex_to_rgb(color_hex)
+    tr, tg, tb = _hex_to_rgb(cfg.get('track_color', '#464646'))
     bar_w    = cfg['bar_width']
     bar_h    = cfg['bar_height']
     top      = (ICON_H - bar_h) // 2
@@ -200,7 +239,7 @@ def _make_bar_pixbuf_simple(fill_pct, color_hex, cfg):
         for x in range(bar_w):
             i = (y * bar_w + x) * 4
             if top <= y < top + bar_h:
-                data[i:i+4] = [r, g, b, 255] if x < fill else [70, 70, 70, 180]
+                data[i:i+4] = [r, g, b, 255] if x < fill else [tr, tg, tb, 190]
     return GdkPixbuf.Pixbuf.new_from_bytes(
         GLib.Bytes.new(bytes(data)),
         GdkPixbuf.Colorspace.RGB, True, 8, bar_w, ICON_H, bar_w * 4,
@@ -217,10 +256,11 @@ class ClaudeStatus:
         self._error = None
         self._notified_threshold = None   # tracks which threshold we've already fired
 
-        # Two tmp files; alternate to force AppIndicator3 to reload the icon.
-        self._icon_paths = [tempfile.mktemp(suffix='.png'),
-                            tempfile.mktemp(suffix='.png')]
+        # Two temp files; alternate to force AppIndicator3 to reload the icon.
+        # Use mkstemp instead of mktemp to avoid TOCTOU races.
+        self._icon_paths = [self._new_temp_png_path(), self._new_temp_png_path()]
         self._icon_idx   = 0
+        atexit.register(self._cleanup_temp_icons)
 
         ph = _make_icon_pixbuf(0.0, self.config['bar_color'], None, None, self.config)
         for p in self._icon_paths:
@@ -232,6 +272,7 @@ class ClaudeStatus:
         )
         self.indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
         self.indicator.set_label('…', '100%')
+        self._apply_panel_order()
 
         self._build_menu()
         self.indicator.set_menu(self.menu)
@@ -244,21 +285,120 @@ class ClaudeStatus:
     def _load_config(self):
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         if CONFIG_FILE.exists():
-            with open(CONFIG_FILE) as f:
-                return {**DEFAULT_CONFIG, **json.load(f)}
+            try:
+                with open(CONFIG_FILE) as f:
+                    loaded = {**DEFAULT_CONFIG, **json.load(f)}
+            except Exception as e:
+                if self.debug:
+                    print(f'[config] invalid config, resetting to defaults: {e}')
+                loaded = DEFAULT_CONFIG.copy()
+            normalized = self._normalize_config(loaded)
+            if normalized != loaded:
+                with open(CONFIG_FILE, 'w') as wf:
+                    json.dump(normalized, wf, indent=2)
+            return normalized
         with open(CONFIG_FILE, 'w') as f:
             json.dump(DEFAULT_CONFIG, f, indent=2)
         return DEFAULT_CONFIG.copy()
 
+    def _normalize_config(self, cfg):
+        out = {**DEFAULT_CONFIG, **cfg}
+
+        def _as_int(value, default):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
+        def _as_bool(value, default=False):
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str):
+                low = value.strip().lower()
+                if low in ('1', 'true', 'yes', 'on'):
+                    return True
+                if low in ('0', 'false', 'no', 'off'):
+                    return False
+            return default
+
+        if out.get('display_mode') not in ('percent', 'bar', 'both'):
+            out['display_mode'] = DEFAULT_CONFIG['display_mode']
+        if out.get('show_value') not in ('remaining', 'used'):
+            out['show_value'] = DEFAULT_CONFIG['show_value']
+        if out.get('show_type') not in ('5hr', 'weekly'):
+            out['show_type'] = DEFAULT_CONFIG['show_type']
+        if out.get('label_side') not in ('left', 'right'):
+            out['label_side'] = DEFAULT_CONFIG['label_side']
+        if out.get('panel_order') not in ('left', 'right'):
+            out['panel_order'] = DEFAULT_CONFIG['panel_order']
+        if out.get('bar_size') not in BAR_SIZE_PRESETS:
+            out['bar_size'] = DEFAULT_CONFIG['bar_size']
+
+        for ck in ('bar_color', 'track_color'):
+            if not _is_valid_hex_color(out.get(ck)):
+                out[ck] = DEFAULT_CONFIG[ck]
+
+        out['bar_width'] = _as_int(out.get('bar_width', DEFAULT_CONFIG['bar_width']), -1)
+        out['bar_height'] = _as_int(out.get('bar_height', DEFAULT_CONFIG['bar_height']), -1)
+        if out['bar_width'] <= 0 or out['bar_height'] <= 0:
+            out['bar_width'], out['bar_height'] = BAR_SIZE_PRESETS[out['bar_size']]
+
+        out['bar_width'] = max(26, min(220, out['bar_width']))
+        out['bar_height'] = max(4, min(18, out['bar_height']))
+
+        out['refresh_interval'] = _as_int(out.get('refresh_interval', 120), 120)
+        out['refresh_interval'] = max(15, out['refresh_interval'])
+
+        out['notify_at_pct'] = _as_int(out.get('notify_at_pct', 0), 0)
+        out['notify_at_pct'] = max(0, min(100, out['notify_at_pct']))
+
+        out['danger_yellow_pct'] = max(1, min(100, _as_int(out.get('danger_yellow_pct', 50), 50)))
+        out['danger_orange_pct'] = max(1, min(100, _as_int(out.get('danger_orange_pct', 75), 75)))
+        out['danger_red_pct'] = max(1, min(100, _as_int(out.get('danger_red_pct', 90), 90)))
+        out['danger_yellow_pct'], out['danger_orange_pct'], out['danger_red_pct'] = sorted(
+            [out['danger_yellow_pct'], out['danger_orange_pct'], out['danger_red_pct']]
+        )
+
+        out['danger_bar'] = _as_bool(out.get('danger_bar', False), False)
+        out['danger_text'] = _as_bool(out.get('danger_text', False), False)
+        out['show_logo'] = _as_bool(out.get('show_logo', False), False)
+        return out
+
     def _save_config(self):
+        self.config = self._normalize_config(self.config)
         with open(CONFIG_FILE, 'w') as f:
             json.dump(self.config, f, indent=2)
+
+    def _apply_panel_order(self):
+        # AppIndicator can reorder within the tray side; GNOME decides panel side.
+        idx = 0 if self.config.get('panel_order', 'right') == 'left' else 10000
+        try:
+            self.indicator.set_ordering_index(idx)
+        except Exception:
+            if self.debug:
+                print('[ui] set_ordering_index not supported by this shell/extension')
 
     # ── Icon helpers ───────────────────────────────────────────────────────────
 
     def _next_icon_path(self):
         self._icon_idx ^= 1
         return self._icon_paths[self._icon_idx]
+
+    @staticmethod
+    def _new_temp_png_path():
+        fd, path = tempfile.mkstemp(suffix='.png', prefix='claude-status-')
+        os.close(fd)
+        return path
+
+    def _cleanup_temp_icons(self):
+        for p in self._icon_paths:
+            try:
+                os.unlink(p)
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                if self.debug:
+                    print(f'[cleanup] failed to delete {p}: {e}')
 
     # ── Network ────────────────────────────────────────────────────────────────
 
@@ -284,12 +424,14 @@ class ClaudeStatus:
 
         node_script = r"""
 const https = require('https');
+const fs = require('fs');
+const token = fs.readFileSync(0, 'utf8').trim();
 const options = {
   hostname: 'claude.ai',
   path: '/api/oauth/usage',
   method: 'GET',
   headers: {
-    'x-api-key': process.env.CLAUDE_TOKEN,
+        'x-api-key': token,
     'Content-Type': 'application/json',
     'User-Agent': 'claude-code/2.1.89',
     'anthropic-client-version': '2.1.89',
@@ -322,11 +464,12 @@ req.end();
             return None, 'node not found. Install Node.js to use this indicator.'
 
         try:
-            env = os.environ.copy()
-            env['CLAUDE_TOKEN'] = token
             result = subprocess.run(
                 [node_bin, '-e', node_script],
-                capture_output=True, text=True, timeout=15, env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                input=token,
             )
             if self.debug:
                 print(f'[node] stdout: {result.stdout[:800]}')
@@ -416,6 +559,7 @@ req.end();
 
         embed_in_icon = showing_text and (
             danger_text or
+            mode == 'percent' or
             (mode == 'both' and label_side == 'left')
         )
 
@@ -554,6 +698,24 @@ req.end();
             side_menu.append(ri)
         self.menu.append(side_item)
 
+        # ── Tray order ───────────────────────────────────────────────────────
+        tray_item = Gtk.MenuItem(label='Tray order')
+        tray_menu = Gtk.Menu()
+        tray_item.set_submenu(tray_menu)
+        group = []
+        for val, lbl in [('left', 'Pin further left in tray'),
+                         ('right', 'Pin further right in tray')]:
+            ri = Gtk.RadioMenuItem.new_with_label(group, lbl)
+            group = ri.get_group()
+            ri.set_active(self.config.get('panel_order', 'right') == val)
+            ri.connect('toggled', self._on_panel_order, val)
+            tray_menu.append(ri)
+        tray_menu.append(Gtk.SeparatorMenuItem())
+        tray_note = Gtk.MenuItem(label='Note: GNOME controls true left/right panel side')
+        tray_note.set_sensitive(False)
+        tray_menu.append(tray_note)
+        self.menu.append(tray_item)
+
         # ── Show logo ─────────────────────────────────────────────────────────
         logo_item = Gtk.CheckMenuItem(label='Show Claude logo')
         logo_item.set_active(self.config.get('show_logo', False))
@@ -593,6 +755,24 @@ req.end();
         self._bar_colour_item.connect('activate', self._on_colour_pick)
         self._bar_colour_item.set_sensitive(not self.config.get('danger_bar', False))
         self.menu.append(self._bar_colour_item)
+
+        self._track_colour_item = Gtk.MenuItem(label='Background colour…')
+        self._track_colour_item.connect('activate', self._on_track_colour_pick)
+        self.menu.append(self._track_colour_item)
+
+        # ── Bar size ─────────────────────────────────────────────────────────
+        size_item = Gtk.MenuItem(label='Bar size')
+        size_menu = Gtk.Menu()
+        size_item.set_submenu(size_menu)
+        group = []
+        for val, lbl in [('small', 'Small'), ('medium', 'Medium'),
+                         ('large', 'Large'), ('xl', 'Extra large')]:
+            ri = Gtk.RadioMenuItem.new_with_label(group, lbl)
+            group = ri.get_group()
+            ri.set_active(self.config.get('bar_size', 'medium') == val)
+            ri.connect('toggled', self._on_bar_size, val)
+            size_menu.append(ri)
+        self.menu.append(size_item)
 
         self.menu.append(Gtk.SeparatorMenuItem())
 
@@ -655,6 +835,13 @@ req.end();
         self._save_config()
         if self._usage:
             self._apply_update(self._usage, None)
+
+    def _on_panel_order(self, item, val):
+        if not item.get_active():
+            return
+        self.config['panel_order'] = val
+        self._save_config()
+        self._apply_panel_order()
 
     def _on_show_logo(self, item):
         self.config['show_logo'] = item.get_active()
@@ -726,6 +913,31 @@ req.end();
             if self._usage:
                 self._apply_update(self._usage, None)
         dlg.destroy()
+
+    def _on_track_colour_pick(self, _):
+        dlg = Gtk.ColorChooserDialog(title='Background colour', transient_for=None)
+        rgba = Gdk.RGBA()
+        rgba.parse(self.config.get('track_color', '#464646'))
+        dlg.set_rgba(rgba)
+        if dlg.run() == Gtk.ResponseType.OK:
+            self.config['track_color'] = '#{:02x}{:02x}{:02x}'.format(
+                int(dlg.get_rgba().red   * 255),
+                int(dlg.get_rgba().green * 255),
+                int(dlg.get_rgba().blue  * 255),
+            )
+            self._save_config()
+            if self._usage:
+                self._apply_update(self._usage, None)
+        dlg.destroy()
+
+    def _on_bar_size(self, item, val):
+        if not item.get_active():
+            return
+        self.config['bar_size'] = val
+        self.config['bar_width'], self.config['bar_height'] = BAR_SIZE_PRESETS[val]
+        self._save_config()
+        if self._usage:
+            self._apply_update(self._usage, None)
 
     def _on_notify_pct(self, item, val):
         if not item.get_active():
